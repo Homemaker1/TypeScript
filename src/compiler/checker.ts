@@ -310,6 +310,7 @@ namespace ts {
         let deferredGlobalESSymbolType: ObjectType;
         let deferredGlobalTypedPropertyDescriptorType: GenericType;
         let deferredGlobalPromiseType: GenericType;
+        let deferredGlobalPromiseLikeType: GenericType;
         let deferredGlobalPromiseConstructorSymbol: Symbol;
         let deferredGlobalPromiseConstructorLikeType: ObjectType;
         let deferredGlobalIterableType: GenericType;
@@ -2490,12 +2491,17 @@ namespace ts {
                 if (type.flags & TypeFlags.Index) {
                     const indexedType = (<IndexType>type).type;
                     const indexTypeNode = typeToTypeNodeHelper(indexedType, context);
-                    return createTypeOperatorNode(indexTypeNode);
+                    return createTypeOperatorNode(indexTypeNode, SyntaxKind.KeyOfKeyword);
                 }
                 if (type.flags & TypeFlags.IndexedAccess) {
                     const objectTypeNode = typeToTypeNodeHelper((<IndexedAccessType>type).objectType, context);
                     const indexTypeNode = typeToTypeNodeHelper((<IndexedAccessType>type).indexType, context);
                     return createIndexedAccessTypeNode(objectTypeNode, indexTypeNode);
+                }
+                if (type.flags & TypeFlags.Promised) {
+                    const indexedType = (<PromisedType>type).type;
+                    const indexTypeNode = typeToTypeNodeHelper(indexedType, context);
+                    return createTypeOperatorNode(indexTypeNode, SyntaxKind.PromisedKeyword);
                 }
 
                 Debug.fail("Should be unreachable.");
@@ -3263,6 +3269,17 @@ namespace ts {
                         writePunctuation(writer, SyntaxKind.OpenBracketToken);
                         writeType((<IndexedAccessType>type).indexType, TypeFormatFlags.None);
                         writePunctuation(writer, SyntaxKind.CloseBracketToken);
+                    }
+                    else if (type.flags & TypeFlags.Promised) {
+                        if (flags & TypeFormatFlags.InElementType) {
+                            writePunctuation(writer, SyntaxKind.OpenParenToken);
+                        }
+                        writer.writeKeyword("promised");
+                        writeSpace(writer);
+                        writeType((<PromisedType>type).type, TypeFormatFlags.InElementType);
+                        if (flags & TypeFormatFlags.InElementType) {
+                            writePunctuation(writer, SyntaxKind.CloseParenToken);
+                        }
                     }
                     else {
                         // Should never get here
@@ -5680,7 +5697,8 @@ namespace ts {
             const modifiersType = getApparentType(getModifiersTypeFromMappedType(type)); // The 'T' in 'keyof T'
             const templateReadonly = !!type.declaration.readonlyToken;
             const templateOptional = !!type.declaration.questionToken;
-            if (type.declaration.typeParameter.constraint.kind === SyntaxKind.TypeOperator) {
+            const constraintDeclaration = type.declaration.typeParameter.constraint;
+            if (constraintDeclaration.kind === SyntaxKind.TypeOperator && (<TypeOperatorNode>constraintDeclaration).operator === SyntaxKind.KeyOfKeyword) {
                 // We have a { [P in keyof T]: X }
                 for (const propertySymbol of getPropertiesOfType(modifiersType)) {
                     addMemberForKeyType(getLiteralTypeFromPropertyName(propertySymbol), propertySymbol);
@@ -5694,7 +5712,8 @@ namespace ts {
                 // if the key type is a 'keyof X', obtain 'keyof C' where C is the base constraint of X.
                 // Finally, iterate over the constituents of the resulting iteration type.
                 const keyType = constraintType.flags & TypeFlags.TypeVariable ? getApparentType(constraintType) : constraintType;
-                const iterationType = keyType.flags & TypeFlags.Index ? getIndexType(getApparentType((<IndexType>keyType).type)) : keyType;
+                const iterationType = keyType.flags & TypeFlags.Index ? getIndexType(getApparentType((<IndexType>keyType).type)) :
+                    keyType.flags & TypeFlags.Promised ? getAwaitedType(getApparentType((<PromisedType>keyType).type)) : keyType;
                 forEachType(iterationType, addMemberForKeyType);
             }
             setStructuredTypeMembers(type, members, emptyArray, emptyArray, stringIndexInfo, undefined);
@@ -5747,7 +5766,7 @@ namespace ts {
         function getModifiersTypeFromMappedType(type: MappedType) {
             if (!type.modifiersType) {
                 const constraintDeclaration = type.declaration.typeParameter.constraint;
-                if (constraintDeclaration.kind === SyntaxKind.TypeOperator) {
+                if (constraintDeclaration.kind === SyntaxKind.TypeOperator && (<TypeOperatorNode>constraintDeclaration).operator === SyntaxKind.KeyOfKeyword) {
                     // If the constraint declaration is a 'keyof T' node, the modifiers type is T. We check
                     // AST nodes here because, when T is a non-generic type, the logic below eagerly resolves
                     // 'keyof T' to a literal union type and we can't recover T from that type.
@@ -5769,7 +5788,7 @@ namespace ts {
         function isGenericMappedType(type: Type) {
             if (getObjectFlags(type) & ObjectFlags.Mapped) {
                 const constraintType = getConstraintTypeFromMappedType(<MappedType>type);
-                return maybeTypeOfKind(constraintType, TypeFlags.TypeVariable | TypeFlags.Index);
+                return maybeTypeOfKind(constraintType, TypeFlags.TypeVariable | TypeFlags.Index | TypeFlags.Promised);
             }
             return false;
         }
@@ -7018,6 +7037,10 @@ namespace ts {
             return deferredGlobalPromiseType || (deferredGlobalPromiseType = getGlobalType("Promise" as __String, /*arity*/ 1, reportErrors)) || emptyGenericType;
         }
 
+        function getGlobalPromiseLikeType(reportErrors: boolean) {
+            return deferredGlobalPromiseLikeType || (deferredGlobalPromiseLikeType = getGlobalType("PromiseLike" as __String, /*arity*/ 1, reportErrors)) || emptyGenericType;
+        }
+
         function getGlobalPromiseConstructorSymbol(reportErrors: boolean): Symbol | undefined {
             return deferredGlobalPromiseConstructorSymbol || (deferredGlobalPromiseConstructorSymbol = getGlobalValueSymbol("Promise" as __String, reportErrors));
         }
@@ -7481,7 +7504,15 @@ namespace ts {
         function getTypeFromTypeOperatorNode(node: TypeOperatorNode) {
             const links = getNodeLinks(node);
             if (!links.resolvedType) {
-                links.resolvedType = getIndexType(getTypeFromTypeNode(node.type));
+                const type = getTypeFromTypeNode(node.type);
+                switch (node.operator) {
+                    case SyntaxKind.KeyOfKeyword:
+                        links.resolvedType = getIndexType(type);
+                        break;
+                    case SyntaxKind.PromisedKeyword:
+                        links.resolvedType = getAwaitedType(type) || unknownType;
+                        break;
+                }
             }
             return links.resolvedType;
         }
@@ -8272,6 +8303,9 @@ namespace ts {
             }
             if (type.flags & TypeFlags.IndexedAccess) {
                 return getIndexedAccessType(instantiateType((<IndexedAccessType>type).objectType, mapper), instantiateType((<IndexedAccessType>type).indexType, mapper));
+            }
+            if (type.flags & TypeFlags.Promised) {
+                return getAwaitedType(instantiateType((<IndexType>type).type, mapper)) || unknownType;
             }
             return type;
         }
@@ -9192,6 +9226,22 @@ namespace ts {
                         }
                     }
                 }
+                else if (target.flags & TypeFlags.Promised) {
+                    // A promised S is related to a promised T is S is related to T
+                    if (source.flags & TypeFlags.Promised) {
+                        if (result = isRelatedTo((<PromisedType>source).type, (<PromisedType>target).type, /*reportErrors*/ false)) {
+                            return result;
+                        }
+                    }
+                    // A type S is assignable to promised T if S is assignable to promised C, where C is the
+                    // constraint of T.
+                    const constraint = getConstraintOfType((<PromisedType>target).type);
+                    if (constraint) {
+                        if (result = isRelatedTo(source, getAwaitedType(constraint), reportErrors)) {
+                            return result;
+                        }
+                    }
+                }
 
                 if (source.flags & TypeFlags.TypeParameter) {
                     // A source type T is related to a target type { [P in keyof T]: X } if T[P] is related to X.
@@ -9235,6 +9285,16 @@ namespace ts {
                         // if we have indexed access types with identical index types, see if relationship holds for
                         // the two object types.
                         if (result = isRelatedTo((<IndexedAccessType>source).objectType, (<IndexedAccessType>target).objectType, reportErrors)) {
+                            return result;
+                        }
+                    }
+                }
+                else if (source.flags & TypeFlags.Promised) {
+                    // A type promised S is assignable to T if promised C is assignable to T, where C is the
+                    // constraint of S.
+                    const constraint = getConstraintOfType((<PromisedType>source).type);
+                    if (constraint) {
+                        if (result = isRelatedTo(getAwaitedType(constraint), target, reportErrors)) {
                             return result;
                         }
                     }
@@ -18865,11 +18925,11 @@ namespace ts {
         }
 
         /**
-         * Gets the "promised type" of a promise.
+         * Gets the "promised type" of a promise-like.
          * @param type The type of the promise.
          * @remarks The "promised type" of a type is the type of the "value" parameter of the "onfulfilled" callback.
          */
-        function getPromisedTypeOfPromise(promise: Type, errorNode?: Node): Type {
+        function getPromisedTypeOfPromise(type: Type, errorNode?: Node): Type {
             //
             //  { // promise
             //      then( // thenFunction
@@ -18880,20 +18940,21 @@ namespace ts {
             //  }
             //
 
-            if (isTypeAny(promise)) {
+            if (isTypeAny(type)) {
                 return undefined;
             }
 
-            const typeAsPromise = <PromiseOrAwaitableType>promise;
+            const typeAsPromise = <PromiseOrAwaitableType>type;
             if (typeAsPromise.promisedTypeOfPromise) {
                 return typeAsPromise.promisedTypeOfPromise;
             }
 
-            if (isReferenceToType(promise, getGlobalPromiseType(/*reportErrors*/ false))) {
-                return typeAsPromise.promisedTypeOfPromise = (<GenericType>promise).typeArguments[0];
+            if (isReferenceToType(type, getGlobalPromiseType(/*reportErrors*/ false)) ||
+                isReferenceToType(type, getGlobalPromiseLikeType(/*reportErrors*/ false))) {
+                return typeAsPromise.promisedTypeOfPromise = (<GenericType>type).typeArguments[0];
             }
 
-            const thenFunction = getTypeOfPropertyOfType(promise, "then" as __String);
+            const thenFunction = getTypeOfPropertyOfType(type, "then" as __String);
             if (isTypeAny(thenFunction)) {
                 return undefined;
             }
@@ -18922,6 +18983,14 @@ namespace ts {
             return typeAsPromise.promisedTypeOfPromise = getUnionType(map(onfulfilledParameterSignatures, getTypeOfFirstParameterOfSignature), /*subtypeReduction*/ true);
         }
 
+        function getPromisedTypeForGenericType(type: TypeVariable) {
+            if (!type.resolvedPromisedType) {
+                type.resolvedPromisedType = <PromisedType>createType(TypeFlags.Promised);
+                type.resolvedPromisedType.type = type;
+            }
+            return type.resolvedPromisedType;
+        }
+
         /**
          * Gets the "awaited type" of a type.
          * @param type The type to await.
@@ -18934,6 +19003,10 @@ namespace ts {
         }
 
         function getAwaitedType(type: Type, errorNode?: Node, diagnosticMessage?: DiagnosticMessage): Type | undefined {
+            if (type.flags & TypeFlags.TypeVariable) {
+                return getPromisedTypeForGenericType(<TypeVariable>type);
+            }
+
             const typeAsAwaitable = <PromiseOrAwaitableType>type;
             if (typeAsAwaitable.awaitedTypeOfType) {
                 return typeAsAwaitable.awaitedTypeOfType;
